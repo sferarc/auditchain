@@ -1,0 +1,102 @@
+# This file lives in each mirror repository as
+# .github/workflows/notify-monorepo.yml. It is the return path: when something
+# is merged on the public repository, this tells the source repository to open a
+# pull request bringing that change back.
+#
+# It has to be installed by hand, and it stays installed by hand. Sync Mirrors
+# deletes everything at the mirror root except .git and .github, and
+# copy-into-mirror.sh excludes .github at any depth, so nothing in this
+# directory is ever written by the forward sync. Editing this template changes
+# nothing in any mirror until somebody copies it out. Install it with:
+#
+#   gh api repos/sferarc/<mirror>/contents/.github/workflows/notify-monorepo.yml \
+#     -X PUT -f message=... -f content="$(base64 -i .github/mirror-workflows/notify-monorepo.yml)"
+#
+# scripts/src/mirror-registry-drift.test.ts checks that every mirror registered
+# in sync-mirrors.yml is also registered in sync-from-mirror.yml, so a repo
+# cannot be added to the outbound half and forgotten on the inbound half. It
+# cannot see whether this file is installed: that needs a call to GitHub, and
+# the check for it is in brain/operations/mirror-round-trip.md.
+#
+# Credential: the sferarc org secret GIT_TOKEN (a PAT with repo scope, org
+# visibility "all", so every mirror can read it without a per-repo secret).
+name: Notify Monorepo
+
+on:
+  push:
+    branches: [main]
+  # So the return path can be exercised without pushing anything, and so a
+  # dispatch that was dropped can be replayed.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Trigger monorepo sync
+    runs-on: ubuntu-latest
+    # Do not bounce the source repository's own sync straight back at it.
+    #
+    # This used to compare `github.actor` against the Actions bot account, which
+    # never matched anything: sync-mirrors.yml pushes with a user PAT, so the
+    # actor on its pushes is a real account. Every forward sync therefore fired a
+    # dispatch, and the inbound workflow woke up, cloned, found the content it
+    # had just sent, and exited "No changes to sync". Harmless on a good day,
+    # and not harmless on a bad one: those runs are what filled the
+    # sync-from-mirror concurrency queue with cancellations, and when a rewrite
+    # round-trips imperfectly they open an empty pull request instead (#1533,
+    # #1535 and #1536 were all one added blank line).
+    #
+    # The trailer below is written by sync-mirrors.yml onto every commit it
+    # makes, so it identifies a sync commit exactly, which an actor check could
+    # not. A contribution merged by a person carries no such trailer and is
+    # dispatched normally.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, 'Synced from https://github.com/sferarc/pgbeam/commit/')
+    steps:
+      - name: Dispatch to monorepo
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+          MIRROR_NAME: ${{ github.event.repository.name }}
+          MIRROR_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # A workflow referencing a secret that is not readable here gets an
+          # empty string, and `curl -sf` would have exited non-zero with no
+          # explanation of which of the several possible things went wrong. Say
+          # which one.
+          if [ -z "${GIT_TOKEN}" ]; then
+            echo "::error title=No credential::secrets.GIT_TOKEN is empty in ${MIRROR_NAME}, so the change merged here was NOT reported to the source repository. GIT_TOKEN is an sferarc organisation secret with visibility \"all\"; check it still exists and that this repository is in its scope."
+            exit 1
+          fi
+
+          # Built with printf rather than interpolated into the curl line.
+          # GitHub repository names are [A-Za-z0-9._-] and a sha is hex, so
+          # neither can carry a quote out of the payload, and passing them
+          # through env rather than expanding them into the script body is what
+          # stops this being a script-injection shape in the first place.
+          BODY=$(printf '{"event_type":"mirror-push","client_payload":{"mirror":"%s","sha":"%s"}}' \
+            "$MIRROR_NAME" "$MIRROR_SHA")
+
+          # Capture the status and the body rather than throwing them away.
+          # `curl -sf` printed neither, so a dispatch refused for a reason a
+          # person could act on (token expired, repository renamed, event type
+          # rejected) looked exactly like a network blip.
+          RESPONSE_FILE="$(mktemp)"
+          CODE=$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -X POST \
+            -H "Authorization: token ${GIT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/sferarc/pgbeam/dispatches" \
+            -d "$BODY")
+
+          if [ "$CODE" != "204" ]; then
+            echo "::error title=Dispatch refused::GitHub answered HTTP ${CODE} for the mirror-push dispatch from ${MIRROR_NAME}. The change merged here has NOT reached the source repository and nothing will retry it."
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          echo "Dispatched mirror-push for ${MIRROR_NAME} at ${MIRROR_SHA}."
+          echo "Sync from Mirror should now open a pull request on sferarc/pgbeam." >> "$GITHUB_STEP_SUMMARY"
